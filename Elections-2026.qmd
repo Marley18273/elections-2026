@@ -1,0 +1,261 @@
+---
+title: "North Carolina 2026 Election Results"
+format:
+  html:
+    page-layout: full
+    code-fold: true
+execute:
+  warning: false
+  message: false
+---
+
+<style>
+body {
+  background: #f5f7fb;
+  color: #172033;
+}
+
+.results-intro {
+  max-width: 900px;
+  color: #475569;
+  font-size: 1.05rem;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.metric-card {
+  padding: 1rem 1.2rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: white;
+  box-shadow: 0 3px 12px #1720330b;
+}
+
+.metric-label {
+  color: #64748b;
+  font-size: 0.9rem;
+}
+
+.metric-value {
+  margin: 0.25rem 0;
+  color: #172033;
+  font-size: 1.8rem;
+  font-weight: 700;
+}
+
+.source-note {
+  color: #64748b;
+  font-size: 0.9rem;
+}
+</style>
+
+## 2026 U.S. Senate results
+
+<p class="results-intro">
+Explore the North Carolina county results for Roy Cooper (Democrat) and Michael Whatley (Republican). Counties are colored by which of those two candidates received more votes. Percentages include votes for all candidates in the contest.
+</p>
+
+```{r}
+library(tidyverse)
+library(sf)
+library(leaflet)
+library(tigris)
+
+results_url <- "https://s3.amazonaws.com/dl.ncsbe.gov/ENRS/2026_11_03/results_pct_20261103.zip"
+results_zip <- tempfile(fileext = ".zip")
+download.file(results_url, results_zip, mode = "wb", quiet = TRUE)
+
+results <- readr::read_tsv(
+  unz(results_zip, "results_pct_20261103.txt"),
+  show_col_types = FALSE,
+  progress = FALSE
+)
+unlink(results_zip)
+
+senate_votes <- results |>
+  filter(`Contest Name` == "US SENATE") |>
+  mutate(
+    county = stringr::str_to_upper(County),
+    party = stringr::str_trim(`Choice Party`)
+  ) |>
+  group_by(county, candidate = Choice, party) |>
+  summarize(votes = sum(`Total Votes`), .groups = "drop")
+
+required_candidates <- c("Roy Cooper", "Michael Whatley")
+if (!all(required_candidates %in% senate_votes$candidate)) {
+  stop("The official results file is missing a major-party Senate candidate.")
+}
+
+state_results <- senate_votes |>
+  group_by(candidate, party) |>
+  summarize(votes = sum(votes), .groups = "drop") |>
+  mutate(share = votes / sum(votes) * 100)
+
+state_vote_total <- sum(state_results$votes)
+cooper <- state_results |> filter(candidate == "Roy Cooper")
+whatley <- state_results |> filter(candidate == "Michael Whatley")
+cooper_share <- scales::percent(cooper$votes / state_vote_total, accuracy = 0.1)
+whatley_share <- scales::percent(whatley$votes / state_vote_total, accuracy = 0.1)
+cooper_votes <- scales::comma(cooper$votes)
+whatley_votes <- scales::comma(whatley$votes)
+
+county_totals <- senate_votes |>
+  group_by(county) |>
+  summarize(total_votes = sum(votes), .groups = "drop")
+
+county_party_votes <- senate_votes |>
+  filter(party %in% c("DEM", "REP")) |>
+  select(county, party, votes) |>
+  tidyr::pivot_wider(names_from = party, values_from = votes, values_fill = 0)
+
+county_results <- county_totals |>
+  left_join(county_party_votes, by = "county") |>
+  mutate(
+    DEM = tidyr::replace_na(DEM, 0),
+    REP = tidyr::replace_na(REP, 0),
+    dem_share = DEM / total_votes * 100,
+    rep_share = REP / total_votes * 100,
+    winner = if_else(DEM > REP, "Democrat", "Republican")
+  )
+
+options(tigris_use_cache = TRUE)
+county_shapes <- tigris::counties(
+  state = "NC",
+  cb = TRUE,
+  year = 2024,
+  progress_bar = FALSE
+)
+
+county_map <- county_shapes |>
+  mutate(county = stringr::str_to_upper(NAME)) |>
+  left_join(county_results, by = "county") |>
+  mutate(
+    fill_color = if_else(winner == "Democrat", "#2864a8", "#c63f4d"),
+    county_label = sprintf(
+      "%s County - Cooper: %.1f%% (%s votes); Whatley: %.1f%% (%s votes)",
+      NAME,
+      dem_share,
+      scales::comma(DEM),
+      rep_share,
+      scales::comma(REP)
+    )
+  )
+
+if (nrow(county_map) != 100 || anyNA(county_map$winner)) {
+  stop("County results did not match all 100 North Carolina counties.")
+}
+```
+
+::: {.metric-grid}
+::: {.metric-card}
+<div class="metric-label">Roy Cooper · Democrat</div>
+<div class="metric-value">`r cooper_share`</div>
+`r cooper_votes` votes
+:::
+
+::: {.metric-card}
+<div class="metric-label">Michael Whatley · Republican</div>
+<div class="metric-value">`r whatley_share`</div>
+`r whatley_votes` votes
+:::
+
+::: {.metric-card}
+<div class="metric-label">Counties mapped</div>
+<div class="metric-value">`r nrow(county_map)`</div>
+Colored by the leading major-party candidate
+:::
+:::
+
+::: {.grid}
+::: {.g-col-12 .g-col-lg-7}
+### County results
+
+Hover over a county to see each candidate's share of all Senate votes there.
+
+```{r}
+nc_bounds <- sf::st_bbox(county_map)
+
+leaflet::leaflet(county_map) |>
+  leaflet::addPolygons(
+    fillColor = ~fill_color,
+    fillOpacity = 0.88,
+    color = "#ffffff",
+    weight = 1,
+    label = ~county_label,
+    highlightOptions = leaflet::highlightOptions(
+      weight = 2,
+      color = "#172033",
+      bringToFront = TRUE
+    )
+  ) |>
+  leaflet::fitBounds(
+    nc_bounds[["xmin"]],
+    nc_bounds[["ymin"]],
+    nc_bounds[["xmax"]],
+    nc_bounds[["ymax"]]
+  ) |>
+  leaflet::addLegend(
+    position = "bottomright",
+    colors = c("#2864a8", "#c63f4d"),
+    labels = c("Roy Cooper (Democrat)", "Michael Whatley (Republican)"),
+    title = "County winner",
+    opacity = 1
+  )
+```
+:::
+
+::: {.g-col-12 .g-col-lg-5}
+### Statewide vote totals
+
+```{r}
+state_chart <- state_results |>
+  filter(party %in% c("DEM", "REP")) |>
+  mutate(
+    candidate = factor(candidate, levels = c("Roy Cooper", "Michael Whatley")),
+    label = paste0(
+      scales::comma(votes),
+      " votes · ",
+      scales::percent(share / 100, accuracy = 0.1)
+    )
+  ) |>
+  ggplot(aes(x = candidate, y = votes, fill = party)) +
+  geom_col(width = 0.62) +
+  geom_text(
+    aes(label = label),
+    hjust = -0.08,
+    size = 3.8,
+    color = "#172033"
+  ) +
+  coord_flip(clip = "off") +
+  scale_fill_manual(
+    values = c(DEM = "#2864a8", REP = "#c63f4d"),
+    guide = "none"
+  ) +
+  scale_y_continuous(
+    labels = scales::label_comma(),
+    expand = expansion(mult = c(0, 0.55))
+  ) +
+  labs(x = NULL, y = "Votes") +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(face = "bold"),
+    plot.margin = margin(8, 24, 8, 8)
+  )
+
+state_chart
+```
+:::
+:::
+
+<p class="source-note">
+Data: <a href="https://www.ncsbe.gov/results-data/election-results/historical-election-results-data">North Carolina State Board of Elections, Nov. 3, 2026 results file</a>. Candidate percentages use each candidate's votes divided by all votes cast for the Senate contest, including third-party candidates. County totals sum the file's precinct and administrative-precinct rows. County boundaries: U.S. Census Bureau cartographic boundary files, via the <code>tigris</code> R package.
+</p>
+
+Additional election-night graphics and analysis: <a href="https://ncfree.org/2026/11/election-night-2026-the-extended-cut/">NCFREE's 2026 election analysis</a>.
